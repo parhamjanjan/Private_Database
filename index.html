@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>جستجو در پایگاه‌داده CSV</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", Tahoma, sans-serif;
+         margin: 0; padding: 1rem; background: #f7f7f8; color: #111; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #14161a; color: #eaeaea; }
+    input, select, button, table { background: #1e2228 !important; color: #eaeaea; }
+    th { background: #262b33 !important; }
+    tr:nth-child(even) td { background: #1a1e24; }
+  }
+  header { position: sticky; top: 0; background: inherit; padding: .5rem 0 1rem; z-index: 10; }
+  h1 { font-size: 1.15rem; margin: 0 0 .6rem; }
+  .controls { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }
+  input[type="search"] { flex: 1 1 320px; padding: .6rem .8rem; font-size: 1rem;
+                         border: 1px solid #bbb; border-radius: .5rem; }
+  button { padding: .6rem 1rem; font-size: .95rem; border: 1px solid #bbb;
+           border-radius: .5rem; cursor: pointer; }
+  select { padding: .5rem; border: 1px solid #bbb; border-radius: .5rem; }
+  .status { margin: .6rem 0; font-size: .9rem; opacity: .8; }
+  .files { display: flex; gap: .4rem; flex-wrap: wrap; font-size: .85rem; margin-top: .4rem; }
+  .files label { display: inline-flex; align-items: center; gap: .25rem; padding: .2rem .5rem;
+                 border: 1px solid #bbb; border-radius: 1rem; cursor: pointer; }
+  .tableWrap { overflow: auto; max-height: 70vh; border: 1px solid #ccc; border-radius: .5rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .88rem; background: #fff; }
+  th, td { padding: .45rem .6rem; border-bottom: 1px solid #ddd; text-align: start;
+           white-space: nowrap; max-width: 28ch; overflow: hidden; text-overflow: ellipsis; }
+  th { position: sticky; top: 0; background: #eee; z-index: 1; }
+  tr:nth-child(even) td { background: #fafafa; }
+  mark { background: #ffe066; color: #000; padding: 0 .1em; border-radius: .2em; }
+  .src { font-size: .72rem; opacity: .6; display: block; margin-top: .1rem; }
+  .err { color: #c62828; font-size: .85rem; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>جستجو در همه‌ی فایل‌های CSV پوشه</h1>
+  <div class="controls">
+    <input id="q" type="search" placeholder="عبارت جستجو… (در همه ستون‌ها)" autocomplete="off">
+    <select id="col" title="محدود کردن جستجو به یک ستون">
+      <option value="">همه ستون‌ها</option>
+    </select>
+    <button id="reload" title="بارگذاری مجدد فایل‌ها">↻ بازخوانی</button>
+  </div>
+  <div class="status" id="status">در حال بارگذاری…</div>
+  <div class="files" id="files"></div>
+</header>
+
+<div class="tableWrap">
+  <table>
+    <thead><tr id="head"></tr></thead>
+    <tbody id="body"></tbody>
+  </table>
+</div>
+
+<script>
+/* ================== تنظیمات ==================
+   پوشه‌ای که فایل‌های CSV در آن است.
+   برای GitHub Pages: اگر index.html در ریشه مخزن است،
+   مسیر پوشه را نسبت به ریشه بنویس.
+============================================== */
+const FOLDER = "Telegram/Version1";
+
+/* اگر فهرست فایل‌ها را دستی می‌دانی، اینجا بنویس (مثلاً ["a.csv","b.csv"]).
+   اگر خالی باشد، کد تلاش می‌کند فهرست را از GitHub API بگیرد. */
+const MANUAL_FILES = [];
+
+/* نام کاربری و مخزن و شاخه (برای گرفتن فهرست فایل‌ها) */
+const GH = { owner: "parhamjanjan", repo: "Private_Database", branch: "main" };
+
+/* ============================================================
+   منطق:
+   1) لیست فایل‌های CSV پوشه را پیدا می‌کند.
+   2) هر فایل را با یک پارسر ساده CSV می‌خواند.
+   3) همه ردیف‌ها را یکجا نگه می‌دارد و با تایپ جستجو،
+      در همه ستون‌ها (یا ستون انتخابی) فیلتر می‌کند.
+   ============================================================ */
+
+const el = {
+  q: document.getElementById("q"),
+  col: document.getElementById("col"),
+  status: document.getElementById("status"),
+  files: document.getElementById("files"),
+  head: document.getElementById("head"),
+  body: document.getElementById("body"),
+  reload: document.getElementById("reload"),
+};
+
+let ROWS = [];        // [{ data: [..], headers: [..], file: "..." }]
+let HEADERS = [];     // union of all headers
+let activeFiles = new Set();
+
+/* ---------- پیدا کردن فایل‌های CSV ---------- */
+async function discoverFiles() {
+  if (MANUAL_FILES.length) return MANUAL_FILES;
+
+  // اول: تلاش با GitHub API (فقط برای مخزن عمومی یا فایلی که API دسترسی دارد)
+  try {
+    const api = `https://api.github.com/repos/${GH.owner}/${GH.repo}/contents/${FOLDER}?ref=${GH.branch}`;
+    const res = await fetch(api, { headers: { Accept: "application/vnd.github+json" } });
+    if (res.ok) {
+      const list = await res.json();
+      const files = list
+        .filter(x => x.type === "file" && /\.csv$/i.test(x.name))
+        .map(x => x.name);
+      if (files.length) return files;
+    }
+  } catch (e) { /* بی‌خیال */ }
+
+  // دوم: تلاش با manifest.csv در همان پوشه (هر خط یک نام فایل)
+  try {
+    const res = await fetch(`${FOLDER}/manifest.csv`, { cache: "no-store" });
+    if (res.ok) {
+      const txt = await res.text();
+      const files = txt.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
+        .map(s => s.replace(/^.*\//, "")); // اگر مسیر کامل بود، فقط نام
+      if (files.length) return files;
+    }
+  } catch (e) { /* بی‌خیال */ }
+
+  throw new Error("فهرست فایل‌های CSV پیدا نشد. از MANUAL_FILES استفاده کن یا manifest.csv بساز.");
+}
+
+/* ---------- پارسر CSV (پشتیبانی از quote و کاما داخل فیلد) ---------- */
+function parseCSV(text) {
+  text = text.replace(/^\uFEFF/, ""); // حذف BOM
+  const rows = [];
+  let row = [], field = "", inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i], n = text[i + 1];
+    if (inQuotes) {
+      if (c === '"' && n === '"') { field += '"'; i++; }
+      else if (c === '"') { inQuotes = false; }
+      else field += c;
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === ",") { row.push(field); field = ""; }
+      else if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+      else if (c === "\r") { /* ignore */ }
+      else field += c;
+    }
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows.filter(r => r.length && !(r.length === 1 && r[0].trim() === ""));
+}
+
+/* ---------- بارگذاری همه فایل‌ها ---------- */
+async function loadAll() {
+  el.status.textContent = "در حال پیدا کردن فایل‌ها…";
+  ROWS = [];
+  HEADERS = [];
+  el.head.innerHTML = "";
+  el.body.innerHTML = "";
+  el.files.innerHTML = "";
+  el.col.innerHTML = '<option value="">همه ستون‌ها</option>';
+  activeFiles = new Set();
+
+  let files;
+  try {
+    files = await discoverFiles();
+  } catch (e) {
+    el.status.innerHTML = `<span class="err">${e.message}</span>`;
+    return;
+  }
+
+  el.status.textContent = `در حال خواندن ${files.length} فایل…`;
+  const headerSet = [];
+
+  for (const name of files) {
+    const url = `${FOLDER}/${encodeURIComponent(name)}`;
+    try {
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) throw new Error(res.status);
+      const text = await res.text();
+      const table = parseCSV(text);
+      if (!table.length) continue;
+
+      // تشخیص هدر: اگر ردیف اول همه سلول‌ها غیرعددی و کوتاه باشند، هدر است
+      let headers, start = 0;
+      const first = table[0];
+      const looksHeader = first.every(c => c.length < 60 && !/^-?\d+([.,]\d+)?$/.test(c.trim()));
+      if (looksHeader) { headers = first.map(h => h.trim()); start = 1; }
+      else { headers = first.map((_, i) => `ستون ${i + 1}`); }
+
+      headers.forEach(h => { if (!headerSet.includes(h)) headerSet.push(h); });
+
+      for (let r = start; r < table.length; r++) {
+        ROWS.push({ data: table[r], headers, file: name });
+      }
+      activeFiles.add(name);
+    } catch (e) {
+      console.warn("خطا در خواندن", name, e);
+    }
+  }
+
+  HEADERS = headerSet;
+
+  // ساخت هدر جدول
+  el.head.innerHTML = "";
+  HEADERS.forEach(h => {
+    const th = document.createElement("th");
+    th.textContent = h;
+    el.head.appendChild(th);
+  });
+
+  // پر کردن select ستون‌ها
+  HEADERS.forEach(h => {
+    const o = document.createElement("option");
+    o.value = h; o.textContent = h;
+    el.col.appendChild(o);
+  });
+
+  // چک‌باکس فایل‌ها
+  el.files.innerHTML = "";
+  [...activeFiles].sort().forEach(f => {
+    const label = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = true; cb.dataset.file = f;
+    cb.addEventListener("change", () => {
+      if (cb.checked) activeFiles.add(f); else activeFiles.delete(f);
+      render();
+    });
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(f));
+    el.files.appendChild(label);
+  });
+
+  el.status.textContent = `${ROWS.length.toLocaleString("fa")} ردیف از ${activeFiles.size} فایل بارگذاری شد.`;
+  render();
+}
+
+/* ---------- رندر با فیلتر ---------- */
+function norm(s) { return (s ?? "").toString().toLowerCase(); }
+
+function render() {
+  const q = norm(el.q.value.trim());
+  const colName = el.col.value;
+  const colIndex = colName ? HEADERS.indexOf(colName) : -1;
+
+  const frag = document.createDocumentFragment();
+  let shown = 0, matched = 0;
+  const MAX = 2000; // حداکثر ردیف نمایش برای سرعت
+
+  for (const row of ROWS) {
+    if (!activeFiles.has(row.file)) continue;
+    matched++;
+
+    // نگاشت داده‌ی ردیف به هدرهای کلی
+    const cells = HEADERS.map(h => {
+      const i = row.headers.indexOf(h);
+      return i >= 0 ? row.data[i] ?? "" : "";
+    });
+
+    let ok = true;
+    if (q) {
+      if (colIndex >= 0) {
+        ok = norm(cells[colIndex]).includes(q);
+      } else {
+        ok = cells.some(c => norm(c).includes(q));
+      }
+    }
+    if (!ok) continue;
+
+    if (shown >= MAX) continue;
+    shown++;
+
+    const tr = document.createElement("tr");
+    cells.forEach((c, i) => {
+      const td = document.createElement("td");
+      td.title = c;
+      if (q && (colIndex < 0 || i === colIndex)) {
+        const idx = norm(c).indexOf(q);
+        if (idx >= 0) {
+          td.innerHTML =
+            escapeHtml(c.slice(0, idx)) +
+            "<mark>" + escapeHtml(c.slice(idx, idx + q.length)) + "</mark>" +
+            escapeHtml(c.slice(idx + q.length));
+        } else td.textContent = c;
+      } else td.textContent = c;
+      tr.appendChild(td);
+    });
+    // نام فایل به عنوان tooltip روی ردیف
+    tr.title = row.file;
+    frag.appendChild(tr);
+  }
+
+  el.body.innerHTML = "";
+  el.body.appendChild(frag);
+
+  const total = [...activeFiles].reduce((s, f) => s + ROWS.filter(r => r.file === f).length, 0);
+  el.status.textContent =
+    `${shown.toLocaleString("fa")} ردیف نمایش داده شد` +
+    (shown >= MAX ? " (محدود به ۲۰۰۰ ردیف)" : "") +
+    ` از ${matched.toLocaleString("fa")} ردیف در فایل‌های فعال` +
+    (q ? ` — جستجو: «${el.q.value}»` : "") +
+    (colName ? ` در ستون «${colName}»` : " در همه ستون‌ها");
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, m => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[m]));
+}
+
+/* ---------- رویدادها ---------- */
+let t;
+el.q.addEventListener("input", () => { clearTimeout(t); t = setTimeout(render, 150); });
+el.col.addEventListener("change", render);
+el.reload.addEventListener("click", loadAll);
+
+loadAll();
+</script>
+</body>
+</html>
